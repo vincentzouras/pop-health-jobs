@@ -48,7 +48,8 @@ fi
 # 2. the installed copy passes its own tests
 if out=$("$PY" "$DEST" --selftest 2>&1 | tail -1); then
   case "$out" in
-    *"0 title failures"*"0 location failures"*"0 discovery failures"*) ok "selftest" "$out" ;;
+    *"0 title failures"*"0 location failures"*"0 boundary failures"*"0 lock failures"*)
+      ok "selftest" "$out" ;;
     *) bad "selftest" "$out" ;;
   esac
 else
