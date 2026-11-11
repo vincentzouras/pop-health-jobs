@@ -8,7 +8,7 @@ Two parts that work together:
 
 | | What it is | Where it runs |
 |---|---|---|
-| **[watcher/](watcher/)** | Scrapes 11 employer job boards daily, filters to roles she can actually apply for, alerts on Telegram | Raspberry Pi (`vez`) via Hermes cron |
+| **[watcher/](watcher/)** | Scrapes 12 employer job boards daily, filters to roles she can actually apply for, alerts on Telegram | Raspberry Pi (`vez`) via Hermes cron |
 | **[web/](web/)** | Dashboard showing every match, with one-click Apply, Applied / Not-for-me tracking, and an optional note on each dismissal | Vercel + Postgres |
 
 **Live:** https://pop-health-jobs.vercel.app
@@ -19,21 +19,19 @@ Two parts that work together:
 
 ```
 vez (Pi)                              Vercel                       Postgres (Neon)
-────────                              ──────                       ───────────────
-every 5m  job_watch.py --gate ── GET /api/watch ──▶ paused? due? ──▶ meta
+──────                                ──────                       ───────────────
 07:45  deploy-job-watch.sh ── git pull ──▶ install + selftest
-when due  watcher/job_watch.py
-  ├─ Camofox browser ──▶ 11 job boards
+08:00  watcher/job_watch.py        one run, every employer
+  ├─ Camofox browser ──▶ 12 job boards
   ├─ relevance filter (regex, deterministic)
-  ├─ route card per new match ──▶ openrouteservice (geocode, snap, drive time)
+  ├─ route card per match ──▶ openrouteservice (geocode, snap, drive time)
   ├─ Telegram alert ──────────────▶ phone
   ├─ POST /api/ingest ─────────────▶ /api/ingest ──upsert──▶ jobs + job_maps
   │    (jobs, scanner hash, maps)             ▲               (status: new/
   │                                           │                applied/ignored)
   │                               /api/jobs   │
-  ├── GET /api/suppressed ────────────────────┘
-  │    (skips jobs already applied to)
-  └─ POST /api/sources/discover ──▶ source_candidates (sites worth a parser)
+  └── GET /api/suppressed ────────────────────┘
+       (skips jobs already applied to)
 ```
 
 Each card also carries a **route card** — the drive from the nearer of the two cluster pins
@@ -53,38 +51,17 @@ That is what keeps a run free, reproducible and immune to invented postings.
 
 ---
 
-## Two triggers, and only one of them scans
+## One trigger
 
-| Trigger | What it does | Cadence |
-|---|---|---|
-| `8e7a83cfdc37` — the scan | Scans **every** employer in the list, native and added | 08:00 daily, fixed |
-| `cbf26d448432` — the hunt | Finds employers that are **not** in the list yet and installs the readable ones | every 30 min, but only when the dashboard switch is on *and* the cooldown (6 h) has passed |
+Scanning is a single fixed run: `8e7a83cfdc37` at **08:00 daily**, which scrapes every employer in
+the `SOURCES` table and nothing else. There is no second schedule, no interval knob and no on/off
+switch, because re-scanning the same boards more often only costs page loads.
 
-The dashboard owns exactly one switch: **"looking for new employers"**. It does not re-scan
-employers you already watch — that is still one fixed daily run, so the list never gets hammered.
-
-When the switch is on, `hunt-employers.sh` asks a Hermes agent to propose employers in the two
-50-minute areas, probe each candidate board with `job_watch.py --probe-source`, and install the
-ones that pass. A proposal is only believed when a real page load agrees: the probe counts
-postings and names the applicant tracking system, so a hallucinated or stale careers URL dies
-there instead of taking a slot in tomorrow's scan.
-
-Added employers are **data, not code**: `~/.hermes/job-watches/sources.d/<slug>.json` names a
-parser from a whitelist (`workday`, `ukg`, `neogov`, `phenom`, …) and is loaded at startup, so it
-is scanned by the same 08:00 run. The board lists what was added, with a **Stop** button that
-queues the removal for the Pi's next run.
-
-```bash
-PY=~/.hermes/tools/python-3.14.7+20260901-linux-arm64/bin/python3
-$PY job_watch.py --list-sources                          # native + added, with health
-$PY job_watch.py --probe-source "https://…" --name X      # JSON: platform, postings, sample
-$PY job_watch.py --probe-source "https://…" --name X --add  # install it if it passed
-$PY job_watch.py --add-source '<the "source" object>'
-$PY job_watch.py --drop-source <slug>
-```
-
-Nothing about this is unattended guesswork: an employer joins the watch only through a parser
-that already works on its ATS, and it can be removed from the board in one click.
+**The Pi does not look for new employers.** An earlier version did — an agent proposing employers
+and probing their boards — and it was removed because it muddied the app's purpose and put an
+unverified guess in front of the one thing that matters: the employer list. Adding an employer is a
+deliberate edit to `SOURCES` in `job_watch.py`, because a new board needs a parser for its
+applicant tracking system, and a parser has to be written and tested against the real site.
 
 ---
 
@@ -97,7 +74,6 @@ The repo is the source of truth; the Pi holds a checkout and a deployed copy.
 | Git checkout on the Pi | `~/.hermes/pop-health-jobs` |
 | Deployed script (what cron runs) | `~/.hermes/scripts/job_watch.py` |
 | Cron shim (stable, never edited) | `~/.hermes/scripts/deploy-job-watch.sh` |
-| Employer hunt (the 30-minute tick) | `~/.hermes/scripts/hunt-employers.sh` |
 | Deploy logic (lives in the repo) | [`deploy/deploy-job-watch.sh`](deploy/deploy-job-watch.sh) |
 
 A second Hermes cron job (`dee89f6f4230`, 07:45) runs the shim, which pulls `main`, self-tests
@@ -121,7 +97,6 @@ watcher/
 
 deploy/
   deploy-job-watch.sh   pull → selftest → install atomically → verify hash
-  hunt-employers.sh     finds + installs new employers (only when the switch is on)
   cron-shim.sh          installed as ~/.hermes/scripts/deploy-job-watch.sh
   status-job-watch.sh   PASS/FAIL health check for the whole Pi side
 
@@ -135,9 +110,6 @@ web/
     theme.ts            MUI theme (Roboto, flat buttons)
     Providers.tsx       theme + CssBaseline wrapper
     api/ingest/         POST snapshot from the Pi (token auth, idempotent upsert)
-    api/discover/       GET/POST the employer-hunt switch + added sources
-    api/sources/        GET the discovery queue, POST watch/dismiss on a host
-    api/sources/discover/  POST the Pi's candidate hosts (token auth)
     api/jobs/           GET active + archive
     api/jobs/[id]/      PATCH status, DELETE an addressed not-applicable row
     api/suppressed/     GET jobs already applied to (consumed by the Pi)
@@ -212,5 +184,5 @@ ssh vincent@vez '~/.hermes/tools/python-3.14.7+20260901-linux-arm64/bin/python3 
 ```
 
 Run `--selftest` after **any** change to the filter rules — it has 179 cases covering title
-matching, geography, licensure screens, the parsers, the gate logic and source discovery.
+matching, geography, licensure screens and the parsers.
 

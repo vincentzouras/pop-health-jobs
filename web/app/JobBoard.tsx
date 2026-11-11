@@ -20,7 +20,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
-import type { DiscoveryState, Job, SourceCandidate, Status } from '@/lib/db';
+import type { Job, Status } from '@/lib/db';
 import { AREA_LABEL, type Area } from '@/lib/areas';
 import { employerColor, type EmployerColor } from './employerColor';
 import RouteMap from './RouteMap';
@@ -29,7 +29,6 @@ interface ApiPayload {
   active: Job[];
   archive: Job[];
   /** Sites the scanner has seen but does not scrape yet; empty when nothing new turned up. */
-  candidates: SourceCandidate[];
   meta: {
     lastIngest: string | null;
     scannerVersion: string | null;
@@ -37,7 +36,6 @@ interface ApiPayload {
     /** Rows that fell outside the 50 minute boundary and are hidden. */
     retired: number;
     /** Whether the employer hunt keeps running, and what it has added. */
-    discovery: DiscoveryState;
     db: boolean;
   };
   error?: string;
@@ -318,41 +316,7 @@ export default function JobBoard({ initial }: { initial: ApiPayload }) {
   const [mounted, setMounted] = useState(false);
   const [dismissing, setDismissing] = useState<string | null>(null);
   const [reasonDraft, setReasonDraft] = useState('');
-  const [watch, setWatch] = useState(initial.meta.discovery);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const setDiscovery = useCallback(async (body: { enabled?: boolean; dropSource?: string }) => {
-    try {
-      const res = await fetch('/api/discover', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (res.ok) setWatch((await res.json()) as DiscoveryState);
-    } catch {
-      /* the switch will simply show the old state */
-    }
-  }, []);
-
-  const setSourceAction = useCallback(
-    async (host: string, action: 'watch' | 'dismiss' | 'reset') => {
-      try {
-        const res = await fetch('/api/sources', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ host, action }),
-        });
-        if (res.ok) {
-          const json = (await res.json()) as { candidates: SourceCandidate[] };
-          setData((d) => ({ ...d, candidates: json.candidates }));
-        }
-      } catch {
-        /* the row simply keeps its old state */
-      }
-    },
-    [],
-  );
-
   // Relative times must not be rendered during SSR, or the server and client
   // markup disagree (React hydration error #418).
   useEffect(() => setMounted(true), []);
@@ -522,123 +486,6 @@ export default function JobBoard({ initial }: { initial: ApiPayload }) {
             {data.meta.retired > 0 && ` · ${data.meta.retired} dropped as out of range`}
           </Typography>
         </Stack>
-
-        <Paper variant="outlined" sx={{ p: 2 }}>
-          <Stack spacing={1}>
-            <Stack
-              direction="row"
-              spacing={2}
-              useFlexGap
-              sx={{ flexWrap: 'wrap', alignItems: 'center' }}
-            >
-              <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
-                <Switch
-                  checked={watch.enabled}
-                  onChange={(e) => void setDiscovery({ enabled: e.target.checked })}
-                  slotProps={{ input: { 'aria-label': 'Keep looking for new employers' } }}
-                />
-                <Box>
-                  <Typography variant="body2">
-                    {watch.enabled ? 'Looking for new employers' : 'Not looking for new employers'}
-                  </Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    {watch.enabled
-                      ? 'A Hermes agent finds employers in the two 50 minute areas and probes their boards'
-                      : 'Only the employers below are scanned'}
-                  </Typography>
-                </Box>
-              </Stack>
-              <Box sx={{ flex: 1 }} />
-              <Typography variant="caption" color="text.secondary">
-                Last hunt {rel(watch.lastHuntAt)}
-                {watch.lastHuntAdded !== null && ` · ${watch.lastHuntAdded} added`}
-              </Typography>
-            </Stack>
-
-            <Divider />
-
-            <Typography variant="caption" color="text.secondary">
-              Scanned every morning at 8:00
-              {watch.extra.length > 0
-                ? ` — ${watch.extra.length} employer${watch.extra.length === 1 ? '' : 's'} added since`
-                : ' — the employers in the list'}
-            </Typography>
-            {watch.extra.map((s) => (
-              <Stack
-                key={s.slug}
-                direction="row"
-                spacing={1}
-                useFlexGap
-                sx={{ alignItems: 'center', flexWrap: 'wrap' }}
-              >
-                <Typography variant="body2">{s.name}</Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
-                  {s.parse} · {s.url}
-                </Typography>
-                <Button
-                  size="small"
-                  color="inherit"
-                  onClick={() => void setDiscovery({ dropSource: s.slug })}
-                >
-                  Stop
-                </Button>
-              </Stack>
-            ))}
-            {watch.sourceDrops.length > 0 && (
-              <Typography variant="caption" color="text.secondary">
-                Removing {watch.sourceDrops.join(', ')} on the next run.
-              </Typography>
-            )}
-          </Stack>
-        </Paper>
-
-        {data.candidates?.length > 0 && (
-          <Paper variant="outlined" sx={{ p: 2 }}>
-            <Stack spacing={1}>
-              <Box>
-                <Typography variant="subtitle2">Site discovery</Typography>
-                <Typography variant="caption" color="text.secondary">
-                  Job sites the scanner ran into but does not watch yet. Marking one queued only
-                  records the intent — a parser for it gets written and tested before it can scan.
-                </Typography>
-              </Box>
-              <Divider />
-              {data.candidates.map((c) => (
-                <Stack
-                  key={c.host}
-                  direction="row"
-                  spacing={1}
-                  useFlexGap
-                  sx={{ alignItems: 'center', flexWrap: 'wrap' }}
-                >
-                  <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
-                    {c.host}
-                  </Typography>
-                  <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
-                    {c.seenCount} link{c.seenCount === 1 ? '' : 's'}
-                    {c.employer ? ` · ${c.employer}` : ''} · last seen {rel(c.lastSeen)}
-                  </Typography>
-                  {c.status === 'wanted' ? (
-                    <Chip size="small" color="success" variant="outlined" label="Queued" />
-                  ) : (
-                    <>
-                      <Button size="small" onClick={() => void setSourceAction(c.host, 'watch')}>
-                        Watch
-                      </Button>
-                      <Button
-                        size="small"
-                        color="inherit"
-                        onClick={() => void setSourceAction(c.host, 'dismiss')}
-                      >
-                        Dismiss
-                      </Button>
-                    </>
-                  )}
-                </Stack>
-              ))}
-            </Stack>
-          </Paper>
-        )}
 
         {!data.meta.db && (
           <Alert severity="warning">

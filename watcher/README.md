@@ -1,6 +1,6 @@
 # watcher
 
-`job_watch.py` — one file, Python standard library only. Scrapes 11 employer job boards through
+`job_watch.py` — one file, Python standard library only. Scrapes 12 employer job boards through
 a local [Camofox](https://github.com/jo-inc/camofox-browser) browser, filters results down to roles
 the graduate can actually apply for, pushes them to the dashboard, and sends a Telegram alert for
 anything new.
@@ -58,35 +58,19 @@ PY=~/.hermes/tools/python-3.14.7+20260901-linux-arm64/bin/python3
 $PY job_watch.py             # normal run — silent unless something is new
 $PY job_watch.py --dump      # show relevant / new / rejected
 $PY job_watch.py --dump --dump-all
-$PY job_watch.py --selftest  # 205 filter + parser + discovery + hunt tests; run after ANY rule change
+$PY job_watch.py --selftest  # 168 filter + parser + boundary tests; run after ANY rule change
 $PY job_watch.py --baseline  # mark everything currently live as already-known
 $PY job_watch.py --backfill-posted   # read posted dates off detail pages for jobs lacking one
 $PY job_watch.py --backfill-location # replace a source's guessed city with the real one
 $PY job_watch.py --backfill-maps     # resolve route cards for postings that lack one
-$PY job_watch.py --discover          # fill the "sites we do not scrape yet" queue from the board
-$PY job_watch.py --list-sources      # native + added sources, with health
-$PY job_watch.py --find-board "Employer" [--location "City, ST"] [--add]  # name -> board -> install
-$PY job_watch.py --probe-source URL [--name X]   # is this board worth adding? prints JSON
-$PY job_watch.py --probe-source URL --name X --add   # ...and install it when it passed
-$PY job_watch.py --add-source '<json>'           # install straight from a probe's "source"
-$PY job_watch.py --drop-source <slug>            # stop watching an added source
 $PY job_watch.py --check-origin      # re-geocode the pinned start point and report drift
 $PY job_watch.py --check-maps        # prove ORS_KEY end to end (geocode, snap, route)
 ```
 
-Scanning is one fixed daily trigger (`hunt-employers.sh` does not scan, and neither does anything
-else). The only thing the dashboard switches is the **employer hunt**: propose employers we do not
-watch, probe their boards, install the ones on an ATS we already read as `sources.d/<slug>.json`.
-`--probe-source` is the gate that makes that safe — a board is only added when a real page load
-finds at least five postings on a platform with a known parser. `--discover` (outbound links from
-detail pages we already open) is the passive counterpart and costs no extra page loads.
-
-Discovery is filtered or it is useless. A registrable domain is the unit (`careers.foo.org` and
-`foo.org` are one entry), `LINK_NOISE` drops analytics/CDN/social/webmail/vendor hosts — including
-NEOGOV's own properties, since a county board *is* `governmentjobs.com` — and a source can declare
-`"also": ["chesco.org"]` for an employer's other domains. Entries that today's rules reject are
-pruned from the state file on every run, so the queue cannot accumulate junk that a later
-denylist entry would have prevented.
+Scanning is **one fixed daily trigger** and nothing else. The employer list is `SOURCES` in
+`job_watch.py`; adding an employer is a code change, because each board needs a parser for its
+applicant tracking system. There is no discovery mode, no probe, and no on/off switch — an earlier
+version auto-hunted for employers and it was removed as out of scope.
 
 ## Geography: two clusters, 50 minutes each
 

@@ -1,27 +1,15 @@
 import { NextResponse } from 'next/server';
-import {
-  ensureSchema,
-  getDiscoveryState,
-  getSourceCandidates,
-  hasDb,
-  JOB_COLUMNS,
-  pool,
-  rowToJob,
-  DISCOVERY_DEFAULTS,
-} from '@/lib/db';
+import { ensureSchema, hasDb, JOB_COLUMNS, pool, rowToJob } from '@/lib/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const EMPTY_META = {
-  lastIngest: null, scannerVersion: null, mapOrigin: null, retired: 0,
-  discovery: DISCOVERY_DEFAULTS,
-};
+const EMPTY_META = { lastIngest: null, scannerVersion: null, mapOrigin: null, retired: 0 };
 
 export async function GET() {
   if (!hasDb()) {
     return NextResponse.json(
-      { active: [], archive: [], candidates: [], meta: { ...EMPTY_META, db: false } },
+      { active: [], archive: [], meta: { ...EMPTY_META, db: false } },
       { status: 200 },
     );
   }
@@ -48,20 +36,18 @@ export async function GET() {
     return NextResponse.json({
       active,
       archive,
-      candidates: await getSourceCandidates(),
       meta: {
         lastIngest: metaMap.last_ingest ?? null,
         scannerVersion: metaMap.scanner_version ?? null,
         mapOrigin: (origin.rows[0]?.origin_label as string) ?? null,
         retired,
-        discovery: await getDiscoveryState(),
         db: true,
       },
     });
   } catch (err) {
     return NextResponse.json(
       {
-        active: [], archive: [], candidates: [],
+        active: [], archive: [],
         meta: { ...EMPTY_META, db: true },
         error: String(err).slice(0, 300),
       },

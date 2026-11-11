@@ -36,23 +36,15 @@ git -C "$REPO" merge --ff-only --quiet origin/main || {
 }
 NEW_HEAD=$(git -C "$REPO" rev-parse --short HEAD)
 
-# Keep the status helper and the hunt broker in step with the repo too (both are small and
-# stateless, and both live where Hermes cron looks for --script).
-for helper in status-job-watch.sh hunt-employers.sh; do
-  if [ -f "$REPO/deploy/$helper" ]; then
-    mkdir -p "$DEST_DIR"
-    cp "$REPO/deploy/$helper" "$DEST_DIR/$helper"
-    chmod 775 "$DEST_DIR/$helper"
-  fi
-done
+# Keep the status helper in step with the repo too (it is small, stateless, and has no state).
 if [ -f "$REPO/deploy/status-job-watch.sh" ]; then
   mkdir -p "$HOME/.hermes/bin"
   cp "$REPO/deploy/status-job-watch.sh" "$HOME/.hermes/bin/status-job-watch.sh"
   chmod 775 "$HOME/.hermes/bin/status-job-watch.sh"
 fi
-# The gate shim is gone: scanning is one fixed daily trigger, and the dashboard switch now only
-# controls the employer hunt.
-rm -f "$DEST_DIR/gate-job-watch.sh"
+# Retired helpers: the scan gate and the employer hunt are gone, so a stale copy on the Pi would
+# be a script that talks to an API that no longer exists.
+rm -f "$DEST_DIR/gate-job-watch.sh" "$DEST_DIR/hunt-employers.sh"
 
 NEW_MD5=$(md5sum "$SRC" | cut -d' ' -f1)
 CUR_MD5=$([ -f "$DEST" ] && md5sum "$DEST" | cut -d' ' -f1 || echo none)

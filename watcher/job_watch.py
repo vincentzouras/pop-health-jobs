@@ -11,20 +11,18 @@ Modes
   --baseline     record everything currently live, alert nothing
   --selftest     run the relevance filter against a labelled corpus, print pass/fail
   --backfill-posted  read posted dates off detail pages for known jobs that lack one
-  --discover     fill the "sites we do not scrape yet" queue from known postings
-  --probe-source URL  is this board worth adding? prints JSON (--add installs it when it is)
-  --add-source JSON   install an extra source under ~/.hermes/job-watches/sources.d/
-  --drop-source SLUG  stop watching an extra source
-  --list-sources      every source this run will scan, native and extra
   --dump         print every posting that passed/didn't pass the filter (debug)
   --resimulate N drop N random seen keys so they re-alert (validation only)
+
+The employer list is the SOURCES table below. Adding an employer is a code change, on purpose:
+each one needs a parser for its applicant tracking system, and a parser is not something to
+generate at 3am.
 
 Exit codes: 0 ok, 1 total source failure (so Hermes surfaces it), 0 otherwise.
 """
 from __future__ import annotations
 
 import json
-import base64
 import hashlib
 import math
 import os
@@ -174,20 +172,6 @@ def scanner_version() -> str:
         return hashlib.md5(Path(__file__).read_bytes()).hexdigest()[:12]
     except Exception:
         return "unknown"
-
-
-def discovery_state() -> dict:
-    """Whether the board wants the employer hunt to keep running.
-
-    Returns {} when the board is unreachable, which the hunt treats as "not now": a dashboard
-    outage must not spend money on an LLM run nobody asked for.
-    """
-    if not WEB_URL:
-        return {}
-    try:
-        return _http_json("GET", WEB_URL + "/api/discover", timeout=15) or {}
-    except Exception:
-        return {}
 
 
 def push_snapshot(relevant_jobs: dict, run_at: str, full: bool = True) -> str:
@@ -490,25 +474,6 @@ BODY_JS = r"""
 })()
 """
 
-# Where a posting sends you is the cheapest signal about which applicant tracking system an
-# employer actually uses, and the detail tab is already open when this runs.
-LINKS_JS = r"""
-(() => {
-  const out = [], seen = new Set();
-  for (const a of document.querySelectorAll('a[href]')) {
-    let u;
-    try { u = new URL(a.getAttribute('href'), document.baseURI); } catch (e) { continue; }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
-    const k = u.origin + u.pathname;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(u.href.slice(0, 300));
-    if (out.length >= 80) break;
-  }
-  return out;
-})()
-"""
-
 # AmeriHealth (Phenom) wraps each result in a container whose text holds the title,
 # the city and the requisition id; the anchor alone carries only the title.
 AH_EXTRACT_JS = r"""(() => {""" + DATE_JS + r"""
@@ -628,33 +593,18 @@ def _fetch_jobs(url: str, wait: float = 5.0, extract_js: str = None):
 
 
 def fetch_detail(url: str, wait: float = 4.0):
-    """(main_text_6k, full_text_20k, outbound_links) for a posting.
-
-    The third element is what the source-discovery queue feeds on; an empty list is fine.
-    Everything is empty on failure; the caller then simply learns less.
-    """
+    """Return (main_text_6k, full_text_20k) for a posting. Empty strings on failure."""
     tab = camo("POST", "/tabs", {"userId": USER, "sessionKey": "jobwatch", "url": url})
     tid = tab.get("tabId") or tab.get("id") or (tab.get("tab") or {}).get("tabId")
     if not tid:
-        return "", "", []
+        return "", ""
     try:
         time.sleep(wait)
         ev = camo("POST", "/tabs/%s/evaluate" % tid, {"userId": USER, "expression": BODY_JS})
         res = ev.get("result") or {}
         if isinstance(res, str):
-            body, full = res, res
-        else:
-            body = res.get("body") or ""
-            full = res.get("full") or res.get("body") or ""
-        links = []
-        try:
-            lv = camo("POST", "/tabs/%s/evaluate" % tid, {"userId": USER, "expression": LINKS_JS})
-            got = lv.get("result")
-            if isinstance(got, list):
-                links = [u for u in got if isinstance(u, str)]
-        except Exception:
-            pass
-        return body, full, links
+            return res, res
+        return (res.get("body") or ""), (res.get("full") or res.get("body") or "")
     finally:
         try:
             camo("DELETE", "/tabs/%s?userId=%s" % (tid, USER), timeout=20)
@@ -663,9 +613,9 @@ def fetch_detail(url: str, wait: float = 4.0):
 
 
 def posted_for(url: str, wait: float = 4.0):
-    """(body, posted_date, links) for a posting — one page load, used by the detail screen."""
-    body, full, links = fetch_detail(url, wait)
-    return body, (posted_from_body(full) or posted_from_body(body)), links
+    """(body, posted_date) for a posting — one page load, used by the detail screen."""
+    body, full = fetch_detail(url, wait)
+    return body, (posted_from_body(full) or posted_from_body(body))
 
 
 # --------------------------------------------------------------------------
@@ -971,7 +921,6 @@ SOURCES = [
     {
         "name": "Penn Medicine",
         "base": "https://careers.pennmedicine.org",
-        "also": ["uphshrandyou.com"],
         "parse": parse_penn,
         # Cloudflare-fronted and slow under load; 5s intermittently yields an empty shell.
         "wait": 10.0,
@@ -998,7 +947,6 @@ SOURCES = [
     {
         "name": "WellSpan (York)",
         "base": "https://www.joinwellspan.org",
-        "also": ["wellspan.org"],
         "parse": parse_wellspan,
         "default_location": "York, PA",
         # Their ?keyword= is ignored and the board returns the full list alphabetically,
@@ -1011,7 +959,6 @@ SOURCES = [
     {
         "name": "Chester County",
         "base": "https://www.governmentjobs.com/careers/chesco",
-        "also": ["chesco.org"],
         "parse": parse_govjobs,
         "default_location": "West Chester, PA",
         # NEOGOV ignores ?keyword= (it bounces straight back to the bare board), so the only
@@ -1024,7 +971,6 @@ SOURCES = [
     {
         "name": "Montgomery County",
         "base": "https://www.governmentjobs.com/careers/montcopa",
-        "also": ["montcopa.org"],
         "parse": parse_govjobs,
         "default_location": "Norristown, PA",
         "paginate": {"pattern": "https://www.governmentjobs.com/careers/montcopa?page={page}",
@@ -1034,7 +980,6 @@ SOURCES = [
     {
         "name": "Delaware County",
         "base": "https://www.governmentjobs.com/careers/delcopa",
-        "also": ["delcopa.gov"],
         "parse": parse_govjobs,
         "default_location": "Media, PA",
         "paginate": {"pattern": "https://www.governmentjobs.com/careers/delcopa?page={page}",
@@ -1050,7 +995,6 @@ SOURCES = [
     {
         "name": "Jefferson Health",
         "base": "https://jeffersonhealth.wd5.myworkdayjobs.com",
-        "also": ["jeffersonhealth.org", "wearejefferson.org"],
         "parse": parse_jefferson,
         # Workday encodes city+state in the URL path, so no default is needed.
         "wait": 14.0,
@@ -1122,700 +1066,19 @@ SOURCES = [
     # in the URL slug (and often only a county name, e.g. "-berks-county"). Keeping it
     # either injected out-of-region false positives or required opening every posting.
     # Use the saved Indeed search for UPMC instead.
+    {
+        "name": "ChesPenn Health Services",
+        "base": "https://chespenn.bamboohr.com",
+        "parse": parse_bamboohr,
+        "extract_js": BAMBOO_JS,
+        # BambooHR renders the list late and the cards carry no city at all, only the title;
+        # every ChesPenn site is in Delaware County, so the default is theirs and the daily run
+        # still reads the real city off each posting and corrects it.
+        "wait": 10.0,
+        "default_location": "Eddystone, PA",
+        "urls": ["https://chespenn.bamboohr.com/careers"],
+    },
 ]
-
-
-# --------------------------------------------------------------------------
-# Extra sources: employers added after the fact, without editing this file.
-#
-# A new employer on an applicant tracking system we already speak (Workday, UKG, NEOGOV,
-# Phenom) needs no new code, only configuration: which board URL, which parser, which wait.
-# Those live as JSON in ~/.hermes/job-watches/sources.d/ and are loaded here, so the daily run
-# scans them exactly like the hand-written ones. JSON cannot carry code, so `parse` and
-# `extract` name entries in the whitelists below - an unknown name is rejected, not executed.
-# --------------------------------------------------------------------------
-EXTRA_SOURCES_DIR = STATE_DIR / "sources.d"
-
-# Anything wrong with a sources.d file, reported as a health warning rather than as alert text.
-EXTRA_SOURCE_PROBLEMS = []
-
-PARSERS = {
-    "workday": parse_jefferson,          # Workday puts city+state and title in the URL path
-    "jefferson": parse_jefferson,
-    "ukg": parse_phmc,                   # UKG cards: title in a ukg-link, city in the address
-    "phmc": parse_phmc,
-    "neogov": parse_govjobs,
-    "govjobs": parse_govjobs,
-    "phenom": parse_amerihealth,
-    "amerihealth": parse_amerihealth,
-    "wellspan": parse_wellspan,
-    "christianacare": parse_christianacare,
-    "tower": parse_tower,
-    "penn": parse_penn,
-    "mainline": parse_mainline,
-    "upmc": parse_upmc,
-    "bamboohr": parse_bamboohr,
-}
-
-EXTRACTS = {
-    "auto": None,                        # plain anchors, the default EXTRACT_JS
-    "ukg": PHMC_EXTRACT_JS,
-    "phenom": AH_EXTRACT_JS,
-    "bamboohr": BAMBOO_JS,
-    "workday": None,
-}
-
-# ATS -> (parser, extractor) for the platforms whose boards we already know how to read.
-PLATFORMS = {
-    "workday": ("workday", "auto"),
-    "ukg": ("ukg", "ukg"),
-    "neogov": ("neogov", "auto"),
-    "phenom": ("phenom", "phenom"),
-    "bamboohr": ("bamboohr", "bamboohr"),
-}
-
-
-def load_extra_sources() -> list:
-    """Read sources.d/*.json into source dicts, skipping anything malformed. Never raises.
-
-    Problems are collected rather than printed: this runs at import, and stdout of a run is the
-    alert, so a stray line here would page him about a typo.
-    """
-    if not EXTRA_SOURCES_DIR.is_dir():
-        return []
-    out = []
-    for path in sorted(EXTRA_SOURCES_DIR.glob("*.json")):
-        try:
-            spec = json.loads(path.read_text())
-        except Exception as e:
-            EXTRA_SOURCE_PROBLEMS.append("%s is not valid JSON (%s) - ignored"
-                                         % (path.name, str(e)[:60]))
-            continue
-        if not isinstance(spec, dict) or spec.get("enabled") is False:
-            continue
-        name = str(spec.get("name") or "").strip()
-        parse_name = str(spec.get("parse") or "").strip()
-        extract_name = str(spec.get("extract") or "auto").strip()
-        urls = spec.get("urls") or []
-        pag = spec.get("paginate")
-        base = str(spec.get("base") or "").strip()
-        if not name or parse_name not in PARSERS or extract_name not in EXTRACTS:
-            EXTRA_SOURCE_PROBLEMS.append("%s: unknown parse/extract (%r/%r) - ignored"
-                                         % (path.name, parse_name, extract_name))
-            continue
-        if not (urls or pag):
-            EXTRA_SOURCE_PROBLEMS.append("%s: no urls - ignored" % path.name)
-            continue
-        if not base and urls:
-            base = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(urls[0]))
-        src = {
-            "name": name,
-            "base": base,
-            "parse": PARSERS[parse_name],
-            "urls": [u for u in urls if isinstance(u, str)],
-            "extra": True,
-            "slug": path.stem,
-        }
-        if EXTRACTS[extract_name]:
-            src["extract_js"] = EXTRACTS[extract_name]
-        if isinstance(pag, dict) and pag.get("pattern"):
-            src["paginate"] = pag
-        for key in ("wait", "default_location"):
-            if spec.get(key) is not None:
-                src[key] = spec[key]
-        also = [a for a in (spec.get("also") or []) if isinstance(a, str)]
-        if also:
-            src["also"] = also
-        out.append(src)
-    return out
-
-
-EXTRA_SOURCES = load_extra_sources()
-SOURCES.extend(EXTRA_SOURCES)
-
-
-# --------------------------------------------------------------------------
-# Probing and adding a source: the whole "find new employers" loop.
-#
-# A proposal is not believed until a real page load agrees with it. The probe fetches the board,
-# counts postings and names the ATS, so a hallucinated or stale careers URL dies here instead of
-# taking a slot in tomorrow's scan. Only a board on an ATS we already read becomes a source
-# entry; anything else is reported for someone to write a parser for.
-# --------------------------------------------------------------------------
-def _arg_value(args: list, flag: str) -> str:
-    """Value after --flag, or "" when absent."""
-    if flag in args:
-        i = args.index(flag)
-        if i + 1 < len(args):
-            return args[i + 1]
-    for a in args:
-        if a.startswith(flag + "="):
-            return a.split("=", 1)[1]
-    return ""
-
-
-def _origin(url: str) -> str:
-    parts = urllib.parse.urlsplit(url)
-    return "%s://%s" % (parts.scheme, parts.netloc) if parts.netloc else ""
-
-
-def platform_of(url: str, hrefs=()) -> str:
-    """Which applicant tracking system a board runs on, from its URL and the links it emitted."""
-    blob = " ".join([url] + [str(h) for h in list(hrefs)[:15]]).lower()
-    for needle, platform in (
-        ("myworkdayjobs.com", "workday"), ("myworkdaysite.com", "workday"),
-        ("ultipro.com", "ukg"), ("ukg.com", "ukg"),
-        ("governmentjobs.com", "neogov"), ("neogov.com", "neogov"),
-        ("phenompeople.com", "phenom"), ("/us/en/job/", "phenom"),
-        ("icims.com", "icims"), ("taleo.net", "taleo"),
-        ("greenhouse.io", "greenhouse"), ("lever.co", "lever"),
-        ("smartrecruiters.com", "smartrecruiters"), ("paycomonline.net", "paycom"),
-        ("dayforcehcm.com", "dayforce"), ("bamboohr.com", "bamboohr"),
-        ("workable.com", "workable"), ("jobvite.com", "jobvite"),
-        ("successfactors.com", "successfactors"),
-    ):
-        if needle in blob:
-            return platform
-    return "unknown"
-
-
-SEARCH_UA = ("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) "
-             "Chrome/131.0 Safari/537.36")
-# Paths that look like a job board rather than a marketing page.
-BOARD_PATH = re.compile(r"careers?|jobs?|job-search|search-results|employment|opportunit", re.I)
-# Applicant tracking systems host many employers, so an ATS URL is kept even when the host
-# says nothing about the employer - the agency slug is in the path instead.
-ATS_HOSTS = ("governmentjobs.com", "neogov.com", "myworkdayjobs.com", "myworkdaysite.com",
-             "ultipro.com", "phenompeople.com", "icims.com", "taleo.net", "greenhouse.io",
-             "lever.co", "smartrecruiters.com", "paycomonline.com", "dayforcehcm.com",
-             "bamboohr.com", "workable.com", "jobvite.com", "successfactors.com")
-
-
-def _decode_bing(hrefs) -> list:
-    """Real result URLs from Bing's href list, decoding its /ck/a redirects."""
-    out, seen = [], set()
-    for href in hrefs:
-        if not isinstance(href, str):
-            continue
-        url = href.replace("&amp;", "&")
-        if "bing.com/ck/a" in url:
-            # Bing wraps results: …&u=a1<base64url of the real url>
-            mm = re.search(r"[?&]u=a1([A-Za-z0-9_%\-]+)", url)
-            if not mm:
-                continue
-            raw = urllib.parse.unquote(mm.group(1))
-            raw += "=" * (-len(raw) % 4)
-            try:
-                url = base64.urlsafe_b64decode(raw).decode("utf-8", "replace")
-            except Exception:
-                continue
-        host = site_host(url)
-        if not host or host in LINK_NOISE or "bing.com" in host or "microsoft.com" in host:
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append(url)
-    return out
-
-
-def _bing_results(html: str) -> list:
-    """Same, from a raw Bing HTML page (the no-browser fallback)."""
-    return _decode_bing(m.group(1) for m in re.finditer(r'href="(https?://[^"]+)"', html))
-
-
-BING_JS = r"""
-(() => {
-  const out = [];
-  for (const li of document.querySelectorAll('li.b_algo')) {
-    const a = li.querySelector('h2 a');
-    if (a && a.href) out.push(a.href);
-    if (out.length >= 12) break;
-  }
-  return out;
-})()
-"""
-
-# Engines that answer this network in a real browser, best first. Bing is deliberately absent:
-# its results for a quoted employer name are unrelated pages, from a browser or from plain HTTP.
-SEARCH_ENGINES = (
-    ("yahoo", "https://search.yahoo.com/search?p=%s"),
-    ("ecosia", "https://www.ecosia.org/search?q=%s"),
-    ("brave", "https://search.brave.com/search?q=%s"),
-)
-ENGINE_HOSTS = ("yahoo.com", "search.yahoo", "brave.com", "ecosia.org", "duckduckgo.com",
-                "bing.com", "microsoft.com", "google.com", "w3.org", "mojeek.com")
-
-ANCHORS_JS = r"""
-(() => {
-  const out = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    const h = a.href || '';
-    if (!/^https?:/.test(h)) continue;
-    out.push(h.slice(0, 300));
-    if (out.length >= 40) break;
-  }
-  return out;
-})()
-"""
-
-
-def _ats_targets_on_page(url: str, wait: float = 6.0) -> list:
-    """ATS URLs a careers page points at, whether in an iframe or a plain "apply here" link.
-
-    Family First Health links out to Paycom, ChesPenn to BambooHR; neither board lives on the
-    employer's own domain, and an anchor scrape of the careers page sees neither.
-    """
-    found = []
-    for candidate in probe_iframes(url, wait=wait) + _search_in_browser(url, wait=wait):
-        host = site_host(candidate)
-        if not host:
-            continue
-        on_ats = any(a in host for a in ATS_HOSTS)
-        looks_like_board = bool(BOARD_PATH.search(candidate))
-        if (on_ats or looks_like_board) and candidate not in found:
-            found.append(candidate)
-        if len(found) >= 3:
-            break
-    return found
-
-
-def _search_in_browser(url: str, wait: float = 8.0) -> list:
-    """Every external anchor on a search-results page. [] on any problem."""
-    try:
-        tab = camo("POST", "/tabs", {"userId": USER, "sessionKey": "jobsrch", "url": url})
-        tid = tab.get("tabId") or tab.get("id") or (tab.get("tab") or {}).get("tabId")
-        if not tid:
-            return []
-        try:
-            time.sleep(wait)
-            ev = camo("POST", "/tabs/%s/evaluate" % tid,
-                      {"userId": USER, "expression": ANCHORS_JS})
-            return [u for u in (ev.get("result") or []) if isinstance(u, str)]
-        finally:
-            try:
-                camo("DELETE", "/tabs/%s?userId=%s" % (tid, USER), timeout=20)
-            except Exception:
-                pass
-    except Exception:
-        return []
-
-
-def _unwrap_engine(url: str) -> str:
-    """Yahoo wraps some hits as r.search.yahoo.com/.../RU=<encoded>/RK=…"""
-    m = re.search(r"/RU=([^/]+)/", url)
-    if m:
-        try:
-            return urllib.parse.unquote(m.group(1))
-        except Exception:
-            return url
-    return url
-
-
-def search_boards(employer: str, limit: int = 6) -> list:
-    """Candidate job-board URLs for an employer name, best-looking first. [] on failure.
-
-    This only turns a NAME into candidate URLs - the probe still has to prove each one before it
-    can be added. Results are filtered to ones that mention the employer or live on a known ATS,
-    because a bare search for "York County" happily returns a school in another state.
-    """
-    query = "%s careers jobs" % employer
-    tokens = [t for t in re.split(r"[^a-z0-9]+", employer.lower()) if len(t) > 3]
-    for name, template in SEARCH_ENGINES:
-        hrefs = _search_in_browser(template % urllib.parse.quote(query))
-        kept = []
-        for href in hrefs:
-            url = _unwrap_engine(href.replace("&amp;", "&"))
-            host = site_host(url)
-            if not host or host in LINK_NOISE or any(e in host for e in ENGINE_HOSTS):
-                continue
-            path = (urllib.parse.urlsplit(url).path or "/").lower()
-            on_ats = any(a in host for a in ATS_HOSTS)
-            mentions = any(t in host or t in path for t in tokens)
-            if (on_ats or mentions) and url not in kept:
-                kept.append(url)
-        if kept:
-            looks = [u for u in kept if BOARD_PATH.search(u)]
-            other = [u for u in kept if u not in looks]
-            return (looks + other)[:limit]
-    return []
-
-
-def find_board(employer: str, probe: bool = True, wait: float = 10.0, max_probe: int = 3,
-               location: str = "") -> dict:
-    """Employer name -> the first candidate board that passes the probe. Never raises.
-
-    `location` becomes the source's default city. Single-county employers often publish no city
-    on the list page at all; the daily run then reads the real one off each posting and corrects it.
-    """
-    res = {"employer": employer, "found": False, "checked": [], "source": None}
-    for url in search_boards(employer)[:max_probe]:
-        row = {"url": url, "platform": platform_of(url), "postings": None, "ok": False}
-        res["checked"].append(row)
-        if not probe:
-            continue
-        got = probe_source(url, wait=wait, name=employer, location=location)
-        row["platform"] = got["platform"]
-        row["postings"] = got["postings"]
-        row["ok"] = got["ok"]
-        if got["ok"]:
-            res.update(found=True, source=got["source"], checked=res["checked"])
-            break
-    return res
-
-
-def _name_from_url(url: str) -> str:
-    """Best-effort employer name from a board URL (careers.acme.org -> Acme)."""
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
-    labels = [l for l in host.split(".") if l not in ("www", "careers", "career", "jobs", "job",
-                                                      "recruiting", "apply", "hire")]
-    if labels:
-        return labels[0].replace("-", " ").title()
-    return host or "New source"
-
-
-IFRAMES_JS = r"""
-(() => {
-  const out = [];
-  for (const f of document.querySelectorAll('iframe[src], frame[src]')) {
-    const s = f.getAttribute('src') || '';
-    if (/^https?:/i.test(s)) out.push(s.slice(0, 300));
-    if (out.length >= 10) break;
-  }
-  return out;
-})()
-"""
-
-
-def probe_iframes(url: str, wait: float = 6.0) -> list:
-    """iframe/frame URLs on a careers page. Small employers embed their ATS, so this is how a
-    board that looks empty from the outside is found. [] on any problem."""
-    try:
-        tab = camo("POST", "/tabs", {"userId": USER, "sessionKey": "jobwatch", "url": url})
-        tid = tab.get("tabId") or tab.get("id") or (tab.get("tab") or {}).get("tabId")
-        if not tid:
-            return []
-        try:
-            time.sleep(wait)
-            ev = camo("POST", "/tabs/%s/evaluate" % tid,
-                      {"userId": USER, "expression": IFRAMES_JS})
-            return [u for u in (ev.get("result") or []) if isinstance(u, str)]
-        finally:
-            try:
-                camo("DELETE", "/tabs/%s?userId=%s" % (tid, USER), timeout=20)
-            except Exception:
-                pass
-    except Exception:
-        return []
-
-
-def probe_source(url: str, wait: float = 10.0, name: str = "", location: str = "",
-                 depth: int = 0) -> dict:
-    """Fetch one candidate board and report whether it is worth adding. Never raises."""
-    res = {"url": url, "ok": False, "platform": "unknown", "postings": 0,
-           "sample": [], "error": None, "source": None}
-    platform = platform_of(url)
-    extract = PLATFORMS.get(platform, ("", "auto"))[1] if platform in PLATFORMS else "auto"
-    attempts = [(EXTRACTS[extract], extract)]
-    if EXTRACTS[extract] is not None:
-        attempts.append((None, "auto"))
-    best = None
-    for attempt in attempts:
-        try:
-            raw = fetch_jobs(url, wait=wait, extract_js=attempt[0])
-        except Exception as e:
-            res["error"] = str(e)[:160]
-            continue
-        rows = [r for r in (raw or []) if isinstance(r, dict) and r.get("h")]
-        if best is None or len(rows) > len(best[0]):
-            best = (rows, attempt[1])
-        if len(rows) >= 5:
-            break
-        time.sleep(1.5)
-    if best is None:
-        return res
-    rows, used_extract = best
-    # Nothing on the page itself: the board may be embedded or linked from a careers page. Follow
-    # a link to a known ATS once (small employers almost always outsource to one).
-    if len(rows) < 5 and depth == 0:
-        for candidate in _ats_targets_on_page(url):
-            inner = probe_source(candidate, wait=wait, name=name, location=location, depth=1)
-            if inner["ok"]:
-                inner["via"] = url
-                if name:
-                    inner["source"]["name"] = name
-                return inner
-    res["postings"] = len(rows)
-    res["sample"] = [str(r.get("t") or "")[:80] for r in rows[:5]]
-    res["platform"] = platform_of(url, [r.get("h") for r in rows])
-    parser, extract_for = PLATFORMS.get(res["platform"], ("", used_extract))
-    res["ok"] = bool(res["postings"] >= 5 and parser)
-    res["source"] = {
-        "name": name or _name_from_url(url),
-        "base": _origin(url),
-        "parse": parser or None,
-        "extract": extract_for,
-        "urls": [url],
-        "wait": wait,
-    }
-    if location:
-        res["source"]["default_location"] = location
-    return res
-
-
-def add_source(spec: dict) -> tuple:
-    """Validate and install a source entry. Returns (ok, message)."""
-    if not isinstance(spec, dict):
-        return False, "not an object"
-    name = str(spec.get("name") or "").strip()
-    parse_name = str(spec.get("parse") or "").strip()
-    extract_name = str(spec.get("extract") or "auto").strip()
-    urls = [u for u in (spec.get("urls") or []) if isinstance(u, str)]
-    if not name:
-        return False, "name is required"
-    if parse_name not in PARSERS:
-        return False, "parse must be one of: %s" % ", ".join(sorted(PARSERS))
-    if extract_name not in EXTRACTS:
-        return False, "extract must be one of: %s" % ", ".join(sorted(EXTRACTS))
-    if not urls and not spec.get("paginate"):
-        return False, "urls or paginate is required"
-    for s in SOURCES:
-        if s.get("name", "").lower() == name.lower():
-            return False, "%r is already a source" % name
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "source"
-    path = EXTRA_SOURCES_DIR / (slug + ".json")
-    entry = {
-        "name": name,
-        "base": str(spec.get("base") or (_origin(urls[0]) if urls else "")).strip(),
-        "parse": parse_name,
-        "extract": extract_name,
-        "urls": urls,
-        "added_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    for key in ("wait", "default_location", "also", "paginate"):
-        if spec.get(key) is not None:
-            entry[key] = spec[key]
-    EXTRA_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(entry, indent=2) + "\n")
-    return True, str(path)
-
-
-def drop_source(slug: str) -> bool:
-    path = EXTRA_SOURCES_DIR / (re.sub(r"[^a-z0-9-]+", "", slug.lower()) + ".json")
-    try:
-        path.unlink()
-        return True
-    except Exception:
-        return False
-
-
-def extra_source_rows() -> list:
-    """What the board shows under "watching, added over time"."""
-    rows = []
-    for src in EXTRA_SOURCES:
-        rows.append({
-            "slug": src.get("slug"),
-            "name": src.get("name"),
-            "url": (src.get("urls") or [""])[0],
-            "parse": next((k for k, v in PARSERS.items() if v is src["parse"]), "?"),
-        })
-    return rows
-
-
-def reload_extra_sources() -> None:
-    """Re-read sources.d in place, so a source dropped from the board leaves this run too."""
-    global EXTRA_SOURCES
-    SOURCES[:] = [s for s in SOURCES if not s.get("extra")]
-    EXTRA_SOURCES = load_extra_sources()
-    SOURCES.extend(EXTRA_SOURCES)
-    KNOWN_SITE_HOSTS.clear()
-    KNOWN_SITE_HOSTS.update({site_host(s["base"]) for s in SOURCES if s.get("base")})
-    for s in SOURCES:
-        for h in s.get("also") or ():
-            KNOWN_SITE_HOSTS.add(site_host(h))
-    KNOWN_ORG_KEYS.clear()
-    KNOWN_ORG_KEYS.update({org_key(h) for h in KNOWN_SITE_HOSTS})
-
-
-def sync_source_drops() -> list:
-    """Delete any extra source the board asked us to stop watching. Returns the slugs removed."""
-    if not WEB_URL:
-        return []
-    try:
-        state = _http_json("GET", WEB_URL + "/api/discover", timeout=15) or {}
-    except Exception:
-        return []
-    drops = [d for d in (state.get("sourceDrops") or []) if isinstance(d, str)]
-    removed = [d for d in drops if drop_source(d)]
-    if drops:
-        try:
-            _http_json("POST", WEB_URL + "/api/discover", {"clearDrops": drops}, timeout=15)
-        except Exception:
-            pass
-    return removed
-
-
-# --------------------------------------------------------------------------
-# Source discovery: the queue behind "the app improves over time".
-#
-# Every detail page we open is full of links, and the ones that leave the board are usually the
-# employer's real applicant tracking system (Workday, iCIMS, Taleo, Greenhouse...). Recording
-# those hosts turns "a job we found" into "a site worth adding a parser for". Nothing is added
-# automatically: a new site needs a parser someone writes and validates, so the queue surfaces
-# candidates on the board and a human decides.
-# --------------------------------------------------------------------------
-# Analytics, CDNs, social and legal boilerplate appear on nearly every careers page. Recording
-# them would bury the handful of real job hosts.
-LINK_NOISE = {
-    "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com", "youtube.com",
-    "youtu.be", "vimeo.com", "tiktok.com", "pinterest.com", "glassdoor.com", "indeed.com",
-    "ziprecruiter.com", "google.com", "googleapis.com", "gstatic.com", "googletagmanager.com",
-    "google-analytics.com", "doubleclick.net", "bing.com", "microsoft.com", "apple.com",
-    "adobe.com", "cloudflare.com", "cloudfront.net", "akamaihd.net", "akamaized.net",
-    "amazonaws.com", "azureedge.net", "hotjar.com", "newrelic.com", "nr-data.net", "sentry.io",
-    "segment.com", "mixpanel.com", "onetrust.com", "cookielaw.org", "trustarc.com",
-    "addthis.com", "sharethis.com", "bit.ly", "w3.org", "schema.org", "typekit.net",
-    "fonts.net", "fontawesome.com", "bootstrapcdn.com", "jsdelivr.net", "unpkg.com",
-    "wikipedia.org", "mapquest.com", "openstreetmap.org", "icims.com",
-    # The "about our ads" footer NEOGOV boards all carry.
-    "mozillazine.org", "networkadvertising.org", "aboutads.info", "allaboutdnt.com",
-    # NEOGOV's own properties: the county boards we already scrape *are* governmentjobs.com.
-    "neogov.com", "neoed.com", "powerdms.com", "schooljobs.com",
-    # Webmail and intranet links inside application instructions.
-    "outlook.com", "office.com", "sharepoint.com",
-}
-# iCIMS is in the noise list deliberately: nearly every board links to it for "apply", and its
-# pages are JS shells with no server-rendered listing, so it would sit in the queue forever.
-
-# A hard ceiling: discovery is a to-do list, not a crawl log.
-MAX_CANDIDATES = 60
-
-
-def site_host(url: str) -> str:
-    """The site identity of a URL or bare hostname: registrable domain, no www or careers prefix.
-
-    Grouping by registrable domain keeps `careers.foo.org` and `foo.org` as one entry, which is
-    what "add this site" means to a person. A bare hostname is accepted too, because the source
-    table lists an employer's extra domains that way.
-    """
-    raw = (url or "").strip()
-    try:
-        parts = urllib.parse.urlsplit(raw)
-        if not parts.scheme and not raw.startswith("/"):
-            parts = urllib.parse.urlsplit("//" + raw)
-        host = (parts.hostname or "").lower().strip(".")
-    except ValueError:
-        return ""
-    if not host or "." not in host:
-        return ""
-    labels = host.split(".")
-    # Two-part public suffixes (co.uk, com.au, ...) keep three labels.
-    if len(labels) >= 3 and labels[-2] in {"co", "com", "org", "net", "gov", "ac"} \
-            and len(labels[-1]) == 2:
-        return ".".join(labels[-3:])
-    return ".".join(labels[-2:])
-
-
-# Words a health system puts in front of its own name. Stripping them means a link from
-# joinwellspan.org to wellspan.org is recognised as the employer we already scrape, not a find.
-HOST_PREFIXES = ("www", "careers", "career", "jobs", "job", "recruiting", "recruit", "apply",
-                 "external", "my", "join", "work", "hire", "talent", "portal", "employment")
-
-
-def org_key(host: str) -> str:
-    """The organisation a host belongs to, ignoring the TLD and those prefixes.
-
-    joinwellspan.org and wellspan.org are the same employer, so one linking to the other is not
-    a new job site worth queueing.
-    """
-    if not host:
-        return ""
-    label = host.split(".")[0]
-    for p in HOST_PREFIXES:
-        if label != p and label.startswith(p):
-            label = label[len(p):]
-            break
-    return label.strip("-")
-
-
-KNOWN_SITE_HOSTS = {site_host(s["base"]) for s in SOURCES if s.get("base")}
-# A source may list its employer's own domains too: chesco.org links are not a new job site when
-# we already scrape that county's postings on governmentjobs.com.
-for _s in SOURCES:
-    for _h in _s.get("also") or ():
-        KNOWN_SITE_HOSTS.add(site_host(_h))
-KNOWN_ORG_KEYS = {org_key(h) for h in KNOWN_SITE_HOSTS}
-
-
-def _candidate_ok(host: str) -> bool:
-    """Global rules only: is this host worth keeping in the queue at all?
-
-    Applied to the queue on every run as well, so an entry recorded before a host was added to
-    the noise list (or before a source claimed the domain) falls out by itself.
-    """
-    return bool(host) and host not in KNOWN_SITE_HOSTS and host not in LINK_NOISE \
-        and org_key(host) not in KNOWN_ORG_KEYS
-
-
-def harvest_hosts(st: dict, links, job: dict, now: str) -> int:
-    """Fold one posting's outbound links into the candidate queue. Returns the queue size.
-
-    Never raises: discovery is a convenience, and a broken link list must not fail a scan.
-    """
-    try:
-        queue = st.get("candidates")
-        if not isinstance(queue, dict):
-            queue = {}
-            st["candidates"] = queue
-        own = site_host(job.get("url") or "")
-        own_key = org_key(own)
-        for url in links or ():
-            if not isinstance(url, str):
-                continue
-            host = site_host(url)
-            if host == own or not _candidate_ok(host) or org_key(host) == own_key:
-                continue
-            entry = queue.get(host)
-            if entry:
-                entry["n"] = int(entry.get("n", 0)) + 1
-                entry["last"] = now
-            elif len(queue) < MAX_CANDIDATES:
-                queue[host] = {
-                    "first": now, "last": now, "n": 1, "url": url[:300],
-                    "title": (job.get("title") or "")[:120],
-                    "employer": job.get("employer") or "",
-                }
-        for stale in [h for h in queue if not _candidate_ok(h)]:
-            queue.pop(stale, None)
-        return len(queue)
-    except Exception:
-        return -1
-
-
-def push_candidates(st: dict, run_at: str) -> str:
-    """Send the discovery queue and the extra sources to the board.
-
-    Cheap enough to send in full every run: the queue is at most 60 rows and the extra sources
-    are a handful, and the board is the only place he can see or undo them.
-    """
-    if not WEB_URL or not WEB_TOKEN:
-        return "skipped (no web credentials)"
-    queue = st.get("candidates") or {}
-    if not queue and not EXTRA_SOURCES:
-        return "skipped (nothing discovered)"
-    rows = [{"host": h, "first_seen": v.get("first"), "last_seen": v.get("last"),
-             "seen_count": v.get("n", 1), "sample_url": v.get("url"),
-             "sample_title": v.get("title"), "employer": v.get("employer")}
-            for h, v in sorted(queue.items())]
-    body = {"run_at": run_at, "candidates": rows, "extra": extra_source_rows()}
-    try:
-        _http_json("POST", WEB_URL + "/api/sources/discover", body,
-                   {"x-ingest-token": WEB_TOKEN}, timeout=60)
-    except Exception as e:
-        return "FAILED: %s" % str(e)[:120]
-    return "ok (%d candidate%s, %d extra source%s)" % (
-        len(rows), "" if len(rows) == 1 else "s",
-        len(EXTRA_SOURCES), "" if len(EXTRA_SOURCES) == 1 else "s")
 
 
 # --------------------------------------------------------------------------
@@ -2740,150 +2003,6 @@ def selftest() -> int:
     print("\n--- distance boundary (%d min from either cluster) ---" % CLUSTER_MAX_MINUTES)
     bfails = _boundary_selftest()
 
-    print("\n--- source discovery ---")
-    scases = []
-    for url, want in [
-        ("https://careers.christianacare.org/job-search/?keyword=x", "christianacare.org"),
-        ("https://www.joinwellspan.org/job-listings?jobId=1", "joinwellspan.org"),
-        ("https://jeffersonhealth.wd5.myworkdayjobs.com/ThomasJeffersonExternal", "myworkdayjobs.com"),
-        ("https://recruiting.ultipro.com/PUB1002/JobBoard/c878", "ultipro.com"),
-        ("https://www.governmentjobs.com/careers/chesco?page=2", "governmentjobs.com"),
-        ("https://jobs.foo.co.uk/apply", "foo.co.uk"),
-        ("https://WWW.Example.COM/a", "example.com"),
-        ("mailto:jobs@foo.org", ""),
-        ("/relative/path", ""),
-        ("chesco.org", "chesco.org"),
-    ]:
-        got = site_host(url)
-        scases.append(("site_host %s" % url[:40], got == want, got))
-    # Every board we already scrape must be recognised as known, or every run would queue it.
-    scases.append(("all sources known",
-                   all(site_host(s["base"]) in KNOWN_SITE_HOSTS for s in SOURCES),
-                   sorted(KNOWN_SITE_HOSTS)))
-    # Same employer on a second domain is not a discovery: joinwellspan.org links to wellspan.org.
-    scases.append(("org key joins employer",
-                   org_key("joinwellspan.org") == org_key("wellspan.org") == "wellspan",
-                   (org_key("joinwellspan.org"), org_key("wellspan.org"))))
-    scases.append(("org key keeps tld apart", org_key("example.com") == "example", org_key("example.com")))
-    # An employer's own domain is in the known set, so its links never reach the queue.
-    scases.append(("employer domains known",
-                   {"chesco.org", "montcopa.org", "delcopa.gov", "wellspan.org",
-                    "wearejefferson.org", "uphshrandyou.com"} <= KNOWN_SITE_HOSTS,
-                   sorted(KNOWN_SITE_HOSTS)))
-
-    stamp = "2026-01-01T00:00:00Z"
-    st_d = {}
-    job = {"url": "https://www.joinwellspan.org/job-listings?jobId=1",
-           "employer": "WellSpan (York)", "title": "Social Service Coordinator"}
-    links = ["https://jobs.example.com/a", "https://jobs.example.com/b",
-             "https://www.linkedin.com/company/x", "https://careers.pennmedicine.org/y",
-             "https://www.joinwellspan.org/self", "https://apply.workable.com/foo",
-             "https://www.wellspan.org/about-us"]
-    harvest_hosts(st_d, links, job, stamp)
-    q = st_d.get("candidates", {})
-    scases.append(("noise+known+self dropped", set(q) == {"example.com", "workable.com"}, sorted(q)))
-    scases.append(("repeat counted", q.get("example.com", {}).get("n") == 2,
-                   q.get("example.com", {}).get("n")))
-    scases.append(("sample kept", q.get("workable.com", {}).get("url") == "https://apply.workable.com/foo",
-                   q.get("workable.com", {}).get("url")))
-    scases.append(("context kept",
-                   q.get("example.com", {}).get("employer") == "WellSpan (York)"
-                   and q.get("example.com", {}).get("title") == "Social Service Coordinator",
-                   (q.get("example.com", {}).get("employer"), q.get("example.com", {}).get("title"))))
-    # A second posting on a known candidate must raise the count, never reset it.
-    harvest_hosts(st_d, ["https://jobs.example.com/c"], job, "2026-01-02T00:00:00Z")
-    scases.append(("count is monotonic", q.get("example.com", {}).get("n") == 3,
-                   q.get("example.com", {}).get("n")))
-    scases.append(("last touched", q.get("example.com", {}).get("last") == "2026-01-02T00:00:00Z",
-                   q.get("example.com", {}).get("last")))
-    # Bounded: a board that links out to a hundred hosts must not grow the state file.
-    st_cap = {}
-    harvest_hosts(st_cap, ["https://site%d.com/x" % i for i in range(120)], job, stamp)
-    scases.append(("capped at %d" % MAX_CANDIDATES,
-                   len(st_cap.get("candidates", {})) == MAX_CANDIDATES,
-                   len(st_cap.get("candidates", {}))))
-    scases.append(("garbage in, no raise", harvest_hosts({}, [None, 5, ""], job, stamp) == 0,
-                   harvest_hosts({}, [None, 5, ""], job, stamp)))
-    # A queue carrying entries that today's rules reject (added to the denylist later) is pruned
-    # on sight, so the state file heals itself instead of shipping the same 14 rows forever.
-    st_old = {"candidates": {"neogov.com": {"n": 9}, "chesco.org": {"n": 3},
-                             "ttcportals.com": {"n": 4}}}
-    harvest_hosts(st_old, [], job, stamp)
-    scases.append(("stale entries pruned",
-                   set(st_old["candidates"]) == {"ttcportals.com"}, sorted(st_old["candidates"])))
-    sfails = 0
-    for name, ok, got in scases:
-        if not ok:
-            sfails += 1
-        print("%-6s %-24s -> %r" % ("PASS" if ok else "FAIL", name, got))
-
-    print("\n--- employer hunt plumbing (probe, add, drop) ---")
-    hcases2 = []
-    for url, want in [
-        ("https://acme.wd1.myworkdayjobs.com/External", "workday"),
-        ("https://recruiting.ultipro.com/PUB1/JobBoard/x", "ukg"),
-        ("https://www.governmentjobs.com/careers/foo", "neogov"),
-        ("https://careers.foo.org/us/en/job/123/x", "phenom"),
-        ("https://foo.my.salesforce-sites.com/jobs", "unknown"),
-    ]:
-        got = platform_of(url)
-        hcases2.append(("platform %s" % want, got == want, got))
-    hcases2.append(("name from url", _name_from_url("https://careers.acme-health.org/x") == "Acme Health",
-                    _name_from_url("https://careers.acme-health.org/x")))
-    # BambooHR: the board small nonprofits outsource to (ChesPenn links out to it).
-    hcases2.append(("platform bamboohr", platform_of("https://chespenn.bamboohr.com/careers") == "bamboohr",
-                    platform_of("https://chespenn.bamboohr.com/careers")))
-    bh = parse_bamboohr("https://chespenn.bamboohr.com/careers/1234",
-                        "Community Health Worker - Eddystone, PA", "https://chespenn.bamboohr.com")
-    hcases2.append(("bamboohr parse",
-                    bh and bh[0] == "1234" and bh[1] == "Community Health Worker"
-                    and bh[2] == "Eddystone, PA", bh))
-    hcases2.append(("bamboohr rejects non-job",
-                    parse_bamboohr("https://x.bamboohr.com/careers", "Careers", "") is None, None))
-    bh2 = parse_bamboohr("https://x.bamboohr.com/careers/99",
-                         "Care Coordinator\nGlen Mills, PA", "https://x.bamboohr.com")
-    hcases2.append(("bamboohr city on its own line",
-                    bh2 and bh2[1] == "Care Coordinator" and bh2[2] == "Glen Mills, PA", bh2))
-    # The probe's own refusals: a spec that cannot be scanned must not reach sources.d.
-    hcases2.append(("reject unknown parser",
-                    add_source({"name": "X", "parse": "curl", "urls": ["https://x.test"]})[0] is False,
-                    "parse must be one of"))
-    hcases2.append(("reject no urls",
-                    add_source({"name": "Y", "parse": "govjobs"})[0] is False, "urls required"))
-    hcases2.append(("reject duplicate",
-                    add_source({"name": "Penn Medicine", "parse": "govjobs",
-                                "urls": ["https://x.test"]})[0] is False, "already a source"))
-    saved_dir = EXTRA_SOURCES_DIR
-    tmp = Path(tempfile.mkdtemp(prefix="jw-sources-"))
-    try:
-        globals()["EXTRA_SOURCES_DIR"] = tmp
-        ok_add, msg = add_source({"name": "Test Health", "parse": "ukg", "extract": "ukg",
-                                  "urls": ["https://jobs.testhealth.org/search"], "wait": 9})
-        hcases2.append(("add writes file", ok_add and (tmp / "test-health.json").exists(), msg))
-        loaded = load_extra_sources()
-        hcases2.append(("load maps parser",
-                        bool(loaded) and loaded[0]["parse"] is PARSERS["ukg"]
-                        and loaded[0]["extract_js"] == EXTRACTS["ukg"]
-                        and loaded[0]["wait"] == 9,
-                        loaded[0]["name"] if loaded else None))
-        hcases2.append(("slug from filename",
-                        bool(loaded) and loaded[0]["slug"] == "test-health",
-                        loaded[0]["slug"] if loaded else None))
-        # A hand-broken file must be ignored, not crash the run.
-        (tmp / "broken.json").write_text("{not json")
-        hcases2.append(("broken file ignored", len(load_extra_sources()) == 1,
-                        len(load_extra_sources())))
-        hcases2.append(("drop removes file", drop_source("test-health")
-                        and not (tmp / "test-health.json").exists(), "dropped"))
-    finally:
-        globals()["EXTRA_SOURCES_DIR"] = saved_dir
-        shutil.rmtree(tmp, ignore_errors=True)
-    hfails2 = 0
-    for name, ok, got in hcases2:
-        if not ok:
-            hfails2 += 1
-        print("%-6s %-26s -> %r" % ("PASS" if ok else "FAIL", name, got))
-
     print("\n--- one scan at a time ---")
     try:
         import fcntl  # noqa: F401
@@ -2913,16 +2032,15 @@ def selftest() -> int:
 
     print("\n%d title failures, %d derived failures, %d detail failures, %d jefferson failures, "
           "%d penn failures, %d posted failures, %d location failures, %d map failures, "
-          "%d boundary failures, %d discovery failures, %d lock failures, %d phmc failures, "
-          "%d hunt failures, %d cases total"
-          % (fails, dvfails, dfails, jfails, pfails, postfails, lfails, mfails, bfails, sfails,
-             lkfails, hfails, hfails2,
+          "%d boundary failures, %d lock failures, %d phmc failures, %d cases total"
+          % (fails, dvfails, dfails, jfails, pfails, postfails, lfails, mfails, bfails,
+             lkfails, hfails,
              len(corpus) + len(derived_cases) + len(detail_corpus) + len(jcases) + len(pcases)
-             + len(dcases) + len(bcases) + len(lcases) + len(mcases) + len(scases)
-             + len(lk_cases) + len(hcases) + len(hcases2) + 8))
+             + len(dcases) + len(bcases) + len(lcases) + len(mcases)
+             + len(lk_cases) + len(hcases) + 8))
     return 0 if (fails == 0 and dvfails == 0 and dfails == 0 and jfails == 0 and pfails == 0
                  and postfails == 0 and lfails == 0 and mfails == 0 and bfails == 0
-                 and sfails == 0 and lkfails == 0 and hfails == 0 and hfails2 == 0) else 1
+                 and lkfails == 0 and hfails == 0) else 1
 
 
 def backfill_posted(st) -> int:
@@ -2939,7 +2057,7 @@ def backfill_posted(st) -> int:
     updates, hits = {}, 0
     for k, v in todo:
         try:
-            _body, got, _links = posted_for(v["url"])
+            _body, got = posted_for(v["url"])
         except Exception as e:
             print("  skip %-40s %s" % ((v.get("title") or "")[:40], str(e)[:60]))
             continue
@@ -2985,7 +2103,7 @@ def backfill_location(st) -> int:
     updates, hits, moved, empty = {}, 0, [], 0
     for k, v in todo:
         try:
-            body, _posted, _links = posted_for(v["url"])
+            body, _posted = posted_for(v["url"])
         except Exception as e:
             print("  skip %-40s %s" % ((v.get("title") or "")[:40], str(e)[:60]))
             continue
@@ -3579,109 +2697,10 @@ def relevant_from_state(st) -> dict:
     return out
 
 
-def discover_sources(st, limit: int = 25) -> int:
-    """One-off pass: open known postings and note the job sites they link to.
-
-    The daily run already harvests while it screens genuinely new postings, but that only
-    produces a candidate once a week. This walks the board we already know about instead, so the
-    queue fills the first time it is asked rather than trickling in.
-    """
-    known = relevant_from_state(st)
-    todo = sorted(known.items())
-    print("discover: %d known postings, reading %d detail page(s)" % (len(todo), min(limit, len(todo))))
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    before = len(st.get("candidates") or {})
-    empty = 0
-    for i, (_k, job) in enumerate(todo[:limit], 1):
-        try:
-            body, _posted, links = posted_for(job["url"], wait=3.0)
-        except Exception as e:
-            print("  skip %-40s %s" % ((job.get("title") or "")[:40], str(e)[:60]))
-            continue
-        if not body:
-            empty += 1
-        size = harvest_hosts(st, links, job, now)
-        print("  %2d/%d %-20s %-38s links=%-3d queue=%s"
-              % (i, min(limit, len(todo)), job["employer"][:20], (job.get("title") or "")[:38],
-                 len(links or ()), size))
-    save_state(st)
-    queue = st.get("candidates") or {}
-    print("\n%d candidate site(s), %d new" % (len(queue), len(queue) - before))
-    for host, v in sorted(queue.items(), key=lambda kv: -int(kv[1].get("n", 0))):
-        print("  %-32s %3d link(s)  last %s  %s"
-              % (host, int(v.get("n", 0)), v.get("last", "?"), (v.get("sample_url") or "")[:70]))
-    if empty:
-        print("WARNING: %d detail page(s) returned no text - browser problem, not 'no links'" % empty)
-    print("dashboard sync: %s" % push_candidates(st, now))
-    return 0
-
-
 def main() -> int:
     args = sys.argv[1:]
     if "--selftest" in args:
         return selftest()
-
-    # Employer discovery: name -> board -> install. The probe is what makes it safe.
-    if "--find-board" in args:
-        employer = _arg_value(args, "--find-board")
-        if not employer:
-            print("usage: --find-board 'Employer name' [--no-probe] [--wait 12] [--add]")
-            return 2
-        res = find_board(employer, probe="--no-probe" not in args,
-                         wait=float(_arg_value(args, "--wait") or 10.0),
-                         location=_arg_value(args, "--location"))
-        print(json.dumps(res, indent=2))
-        if "--add" in args:
-            if not res.get("source"):
-                print("NOT added: no board passed the probe", file=sys.stderr)
-                return 1
-            ok, msg = add_source(res["source"])
-            print(("added: %s" % msg) if ok else ("NOT added: %s" % msg), file=sys.stderr)
-            return 0 if ok else 1
-        return 0 if res.get("found") or "--allow-fail" in args else 1
-    if "--probe-source" in args:
-        url = _arg_value(args, "--probe-source")
-        if not url:
-            print("usage: --probe-source <board-url> [--name X] [--location 'City, ST']")
-            return 2
-        res = probe_source(url, wait=float(_arg_value(args, "--wait") or 10.0),
-                           name=_arg_value(args, "--name"),
-                           location=_arg_value(args, "--location"))
-        print(json.dumps(res, indent=2))
-        if "--add" in args and res.get("ok"):
-            ok, msg = add_source(res["source"])
-            print(("added: %s" % msg) if ok else ("NOT added: %s" % msg), file=sys.stderr)
-            return 0 if ok else 1
-        return 0 if res.get("ok") or "--allow-fail" in args else 1
-    if "--add-source" in args:
-        raw = _arg_value(args, "--add-source")
-        if raw == "-" or not raw:
-            raw = sys.stdin.read()
-        try:
-            spec = json.loads(raw)
-        except Exception as e:
-            print("not valid JSON: %s" % str(e)[:120])
-            return 2
-        ok, msg = add_source(spec)
-        print(("added: %s" % msg) if ok else ("NOT added: %s" % msg))
-        return 0 if ok else 1
-    if "--drop-source" in args:
-        slug = _arg_value(args, "--drop-source")
-        ok = drop_source(slug)
-        print(("dropped: %s" % slug) if ok else ("no such source: %s" % slug))
-        return 0 if ok else 1
-    if "--list-sources" in args:
-        d = load_state()
-        health = d.get("source_health", {})
-        for s in SOURCES:
-            h = health.get(s["name"], {})
-            print("%-22s %-9s %-45s last=%-4s peak=%-4s %s"
-                  % (s["name"][:22], "extra" if s.get("extra") else "native",
-                     (s.get("urls") or [(s.get("paginate") or {}).get("pattern", "")])[0][:45],
-                     h.get("last", "?"), h.get("peak", "?"), " ".join(s.get("also") or [])))
-        for p in EXTRA_SOURCE_PROBLEMS:
-            print("PROBLEM:", p)
-        return 0
 
     st = load_state()
     if "--backfill-posted" in args:
@@ -3694,13 +2713,6 @@ def main() -> int:
         return check_maps()
     if "--backfill-maps" in args:
         return backfill_maps(st, relevant_from_state(st))
-    if "--discover" in args:
-        return discover_sources(st)
-
-    # The board owns one thing now: whether to keep hunting for new employers. It can also ask
-    # for an extra source to be dropped, which is a real change to what this run scans.
-    if sync_source_drops():
-        reload_extra_sources()
 
     # One trigger, one scan: the daily cron runs this and every source is scraped. The lock is
     # only there to stop a hand-run from overlapping the cron.
@@ -3806,11 +2818,9 @@ def main() -> int:
             verified.append(k)
             continue
         try:
-            body, found_posted, links = posted_for(job["url"])
+            body, found_posted = posted_for(job["url"])
         except Exception:
-            body, found_posted, links = "", None, []
-        # Free side effect of a tab we already opened: note any site we do not scrape.
-        harvest_hosts(st, links, job, now)
+            body, found_posted = "", None
         if not job.get("posted") and found_posted:
             job["posted"] = found_posted
             st["seen"].setdefault(k, {})["posted"] = found_posted
@@ -3889,8 +2899,6 @@ def main() -> int:
     if maps:
         # After the job rows exist: job_maps has a foreign key onto jobs.
         st["web_sync_maps"] = push_maps(maps, now)
-    if st.get("candidates") or EXTRA_SOURCES:
-        st["web_sync_sources"] = push_candidates(st, now)
     save_state(st)
 
     if not new_keys:

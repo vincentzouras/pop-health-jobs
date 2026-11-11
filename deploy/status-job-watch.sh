@@ -68,12 +68,11 @@ if [ -x "$HERMES/hermes" ]; then
   else
     bad "cron auto-deploy" "not scheduled (drift possible)"
   fi
-  # The hunt is what turns "the app improves over time" into something real; without this cron
-  # the dashboard switch does nothing.
+  # Fail loudly if something is still scheduled that this repo no longer ships.
   if printf '%s' "$LIST" | grep -q "hunt-employers.sh"; then
-    ok "cron employer hunt" "scheduled"
+    bad "cron employer hunt" "still scheduled - the hunt was removed, delete that cron"
   else
-    bad "cron employer hunt" "missing - the dashboard switch does nothing"
+    ok "cron employer hunt" "absent (removed by design)"
   fi
 else
   bad "cron" "hermes not found at $HERMES"
@@ -93,17 +92,12 @@ else
   bad "state freshness" "missing $STATE"
 fi
 
-# 4b. sources added over time (they are scanned by the same daily run)
+# 4b. no leftovers from the removed employer hunt
 EXTRA_DIR="$HOME/.hermes/job-watches/sources.d"
-if [ -d "$EXTRA_DIR" ]; then
-  EXTRA_N=$(ls -1 "$EXTRA_DIR"/*.json 2>/dev/null | wc -l)
-  if [ "$EXTRA_N" -gt 0 ]; then
-    ok "extra sources" "$EXTRA_N added by the hunt ($(ls -1 "$EXTRA_DIR"/*.json 2>/dev/null | xargs -r -n1 basename | sed 's/\.json$//' | paste -sd, -))"
-  else
-    info "extra sources" "none yet"
-  fi
+if [ -d "$EXTRA_DIR" ] && [ -n "$(ls -1 "$EXTRA_DIR"/*.json 2>/dev/null)" ]; then
+  warn "sources.d leftover" "the hunt was removed; $(ls -1 "$EXTRA_DIR"/*.json 2>/dev/null | wc -l) file(s) are now ignored"
 else
-  info "extra sources" "no sources.d directory yet"
+  info "sources.d" "absent (employers come from SOURCES in job_watch.py)"
 fi
 
 # 5. board reachable and reporting the same scanner build
